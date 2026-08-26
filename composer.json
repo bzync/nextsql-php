@@ -1,0 +1,15 @@
+{
+  "name": "nextsql/nextsql",
+  "description": "Official NextSQL PHP driver. Keys never go in URLs.",
+  "type": "library",
+  "license": "proprietary",
+  "require": {
+    "php": ">=8.1",
+    "ext-openssl": "*"
+  },
+  "autoload": {
+    "psr-4": {
+      "NextSQL\\": "src/"
+    }
+  }
+}
