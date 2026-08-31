@@ -16,8 +16,8 @@ if ($addr === false || $ca === false || $addr === '' || $ca === '') {
 $conn = Client::connect([
     'address' => $addr,
     'database' => 'production',
-    'user' => getenv('NEXTSQL_USER') ?: 'app',
-    'password' => getenv('NEXTSQL_PASSWORD') ?: 's3cret',
+    'user' => getenv('NEXTSQL_DATABASE_USER') ?: 'app',
+    'password' => getenv('NEXTSQL_DATABASE_PASS') ?: 's3cret',
     'tls' => [
         'cafile' => $ca,
         'servername' => 'localhost',
@@ -54,6 +54,17 @@ try {
     if ($n !== 2) {
         throw new RuntimeException('streamed ' . $n);
     }
+    // Follower-read control frames round-trip against a standalone server.
+    $status = $conn->nodeStatus();
+    if ($status['role'] !== 'standalone' || $status['healthy'] !== true) {
+        throw new RuntimeException('node status ' . json_encode($status));
+    }
+    $conn->setReadConsistency(Client::READ_BOUNDED, 5000);
+    $bounded = $conn->exec('SELECT sku FROM items WHERE sku = $1', ['A-1']);
+    if (count($bounded['rows']) !== 1) {
+        throw new RuntimeException('bounded read mismatch');
+    }
+    $conn->setReadConsistency(Client::READ_STRONG);
 } finally {
     $conn->close();
 }

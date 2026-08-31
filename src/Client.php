@@ -36,6 +36,15 @@ final class Client
     public const TYPE_READY = 18;
     public const TYPE_UNLOCK = 19;
     public const TYPE_UNLOCK_OK = 20;
+    public const TYPE_IDEMPOTENT_QUERY = 21;
+    public const TYPE_SET_READ_CONSISTENCY = 22;
+    public const TYPE_NODE_STATUS = 23;
+    public const TYPE_NODE_STATUS_RESP = 24;
+
+    /** Read-consistency modes. Values match the wire byte ordering. */
+    public const READ_STRONG = 0;
+    public const READ_BOUNDED = 1;
+    public const READ_STALE = 2;
 
     public const AUTH_PASSWORD = 1;
     public const AUTH_PASSWORD_KEY = 2;
@@ -73,11 +82,105 @@ final class Client
         $c = new self($cfg, $sock);
         try {
             $c->handshake();
+            $mode = $cfg['readConsistency'] ?? self::READ_STRONG;
+            if ((int) $mode !== self::READ_STRONG) {
+                $c->setReadConsistency((int) $mode, (int) ($cfg['maxStalenessMs'] ?? 0));
+            }
         } catch (\Throwable $e) {
             fclose($sock);
             throw $e;
         }
         return $c;
+    }
+
+    /**
+     * setReadConsistency sets this connection's read-consistency mode for
+     * subsequent statements. $maxStalenessMs applies only to BOUNDED (0 selects
+     * the server default window).
+     */
+    public function setReadConsistency(int $mode, int $maxStalenessMs = 0): void
+    {
+        if ($this->busy) {
+            throw new Exception('conflict', 'connection is busy');
+        }
+        $this->writeFrame(self::TYPE_SET_READ_CONSISTENCY, Protocol::encodeSetReadConsistency($mode, $maxStalenessMs));
+        $this->readAck();
+    }
+
+    /**
+     * nodeStatus asks the connected server for its key-free replication health.
+     *
+     * @return array{role:string,hasLeader:bool,healthy:bool,appliedLSN:int,lastContactMs:int,applyBacklog:int}
+     */
+    public function nodeStatus(): array
+    {
+        if ($this->busy) {
+            throw new Exception('conflict', 'connection is busy');
+        }
+        $this->writeFrame(self::TYPE_NODE_STATUS, '');
+        $msg = $this->readFrame();
+        if ($msg['type'] !== self::TYPE_NODE_STATUS_RESP) {
+            $err = $this->unexpected($msg);
+            if ($msg['type'] === self::TYPE_ERROR) {
+                $this->expectReady();
+            }
+            throw $err;
+        }
+        $st = Protocol::decodeNodeStatus($msg['payload']);
+        $this->expectReady();
+        return $st;
+    }
+
+    /**
+     * readAck reads a single control acknowledgement: Ready, or Error followed
+     * by Ready (drained so the session stays usable).
+     */
+    private function readAck(): void
+    {
+        $msg = $this->readFrame();
+        if ($msg['type'] === self::TYPE_READY) {
+            return;
+        }
+        $err = $this->unexpected($msg);
+        if ($msg['type'] === self::TYPE_ERROR) {
+            $this->expectReady();
+        }
+        throw $err;
+    }
+
+    /** txnControl reports whether $sql opens or closes an explicit transaction. */
+    public static function txnControl(string $sql): array
+    {
+        $up = strtoupper(ltrim($sql, " \t\r\n("));
+        $begin = str_starts_with($up, 'BEGIN') || str_starts_with($up, 'START TRANSACTION');
+        $end = str_starts_with($up, 'COMMIT') || str_starts_with($up, 'ROLLBACK');
+        return ['begin' => $begin, 'end' => $end];
+    }
+
+    /**
+     * isReadOnlySQL is a conservative check: a false negative only costs a
+     * leader round trip, and a false positive self-corrects on the leader.
+     * EXPLAIN is excluded because EXPLAIN ANALYZE executes its statement.
+     */
+    public static function isReadOnlySQL(string $sql): bool
+    {
+        $s = ltrim($sql, " \t\r\n(");
+        while (str_starts_with($s, '--')) {
+            $i = strpos($s, "\n");
+            if ($i === false) {
+                return false;
+            }
+            $s = ltrim(substr($s, $i + 1), " \t\r\n(");
+        }
+        $up = strtoupper($s);
+        if (str_starts_with($up, 'SELECT') || str_starts_with($up, 'SHOW')) {
+            return true;
+        }
+        if (str_starts_with($up, 'WITH')) {
+            return !str_contains($up, 'INSERT') && !str_contains($up, 'UPDATE')
+                && !str_contains($up, 'DELETE') && !str_contains($up, 'UPSERT');
+        }
+        return false;
     }
 
     /**

@@ -229,6 +229,16 @@ final class Protocol
                 if ($flag & 1) {
                     return ['value' => ['ref' => true, 'dim' => $dim], 'next' => $off + 3, 'kind' => $kind];
                 }
+                if ($flag & 2) {
+                    $nnz = unpack('V', substr($b, $off + 3, 4))[1];
+                    $indices = [];
+                    $values = [];
+                    for ($i = 0; $i < $nnz; $i++) {
+                        $indices[] = unpack('V', substr($b, $off + 7 + $i * 8, 4))[1];
+                        $values[] = unpack('e', substr($b, $off + 11 + $i * 8, 4))[1];
+                    }
+                    return ['value' => ['dim' => $dim, 'indices' => $indices, 'values' => $values], 'next' => $off + 7 + $nnz * 8, 'kind' => $kind];
+                }
                 $out = [];
                 for ($i = 0; $i < $dim; $i++) {
                     $out[] = unpack('e', substr($b, $off + 3 + $i * 4, 4))[1];
@@ -337,6 +347,51 @@ final class Protocol
         $code = self::readU16String($b, 0, Client::MAX_NAME);
         $msg = self::readU16String($b, $code['next'], Client::MAX_NAME);
         return new Exception($code['value'], $msg['value']);
+    }
+
+    private static function packU64le(int $n): string
+    {
+        return self::u32le($n & 0xFFFFFFFF) . self::u32le(($n >> 32) & 0xFFFFFFFF);
+    }
+
+    private static function u64u(string $b, int $off): int
+    {
+        return self::u32($b, $off) + self::u32($b, $off + 4) * (1 << 32);
+    }
+
+    public static function encodeSetReadConsistency(int $mode, int $maxStalenessMs): string
+    {
+        if ($mode < 0 || $mode > 2) {
+            throw new Exception('invalid_argument', 'unknown read consistency mode');
+        }
+        $ms = $maxStalenessMs > 0 ? $maxStalenessMs : 0;
+        return chr($mode) . self::packU64le($ms);
+    }
+
+    /**
+     * @return array{role:string,hasLeader:bool,healthy:bool,appliedLSN:int,lastContactMs:int,applyBacklog:int}
+     */
+    public static function decodeNodeStatus(string $b): array
+    {
+        $role = self::readU16String($b, 0, Client::MAX_NAME);
+        $off = $role['next'];
+        if (strlen($b) - $off !== 25) {
+            throw new Exception('protocol', 'bad node-status length');
+        }
+        $flags = ord($b[$off]);
+        $off++;
+        // last_contact_ms is a non-negative age, or int64 -1 (uint64 max) for a
+        // follower that has never heard from a leader.
+        $lcHi = self::u32($b, $off + 12);
+        $lastContactMs = $lcHi === 0xFFFFFFFF ? -1 : $lcHi * (1 << 32) + self::u32($b, $off + 8);
+        return [
+            'role' => $role['value'],
+            'hasLeader' => ($flags & 1) !== 0,
+            'healthy' => ($flags & 2) !== 0,
+            'appliedLSN' => self::u64u($b, $off),
+            'lastContactMs' => $lastContactMs,
+            'applyBacklog' => self::u64u($b, $off + 16),
+        ];
     }
 
     public static function encodeDecimal(string $s): string
