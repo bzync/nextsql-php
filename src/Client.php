@@ -64,6 +64,15 @@ final class Client
     public const KIND_BOX = 11;
     public const KIND_LINE = 12;
     public const KIND_POLYGON = 13;
+    public const KIND_BLOB = 14;
+    public const KIND_INT8 = 15;
+    public const KIND_INT16 = 16;
+    public const KIND_INT32 = 17;
+    public const KIND_INT64 = 18;
+    public const KIND_UINT8 = 19;
+    public const KIND_UINT16 = 20;
+    public const KIND_UINT32 = 21;
+    public const KIND_UINT64 = 22;
 
     /** @var resource */
     private $sock;
@@ -120,11 +129,7 @@ final class Client
         $this->writeFrame(self::TYPE_NODE_STATUS, '');
         $msg = $this->readFrame();
         if ($msg['type'] !== self::TYPE_NODE_STATUS_RESP) {
-            $err = $this->unexpected($msg);
-            if ($msg['type'] === self::TYPE_ERROR) {
-                $this->expectReady();
-            }
-            throw $err;
+            throw $this->unexpected($msg);
         }
         $st = Protocol::decodeNodeStatus($msg['payload']);
         $this->expectReady();
@@ -132,8 +137,8 @@ final class Client
     }
 
     /**
-     * readAck reads a single control acknowledgement: Ready, or Error followed
-     * by Ready (drained so the session stays usable).
+     * readAck reads a single control acknowledgement: Ready, or Error
+     * (unexpected() drains the trailing Ready so the session stays usable).
      */
     private function readAck(): void
     {
@@ -141,11 +146,7 @@ final class Client
         if ($msg['type'] === self::TYPE_READY) {
             return;
         }
-        $err = $this->unexpected($msg);
-        if ($msg['type'] === self::TYPE_ERROR) {
-            $this->expectReady();
-        }
-        throw $err;
+        throw $this->unexpected($msg);
     }
 
     /** txnControl reports whether $sql opens or closes an explicit transaction. */
@@ -324,6 +325,7 @@ final class Client
             'secret' => "\x00\x00\x00\x00\x00\x00\x00\x00",
             'database' => (string) ($this->cfg['database'] ?? ''),
             'user' => (string) $this->cfg['user'],
+            'realm' => (string) ($this->cfg['realm'] ?? ''),
         ]));
         $msg = $this->readFrame();
         if ($msg['type'] !== self::TYPE_HELLO_OK) {
@@ -363,6 +365,26 @@ final class Client
     {
         $rows = $this->query($sql, $params);
         return $rows->collect();
+    }
+
+    /** Seal a logical value into the opaque STRING accepted by ENCRYPTED CLIENT. */
+    public function encryptField(string $table, string $column, array $type, mixed $value): ?string
+    {
+        $provider = $this->cfg['fieldKeys'] ?? null;
+        if (!$provider instanceof FieldKeyProvider) {
+            throw new Exception('invalid_argument', 'field key provider is required');
+        }
+        return FieldEncryption::encrypt($provider, (string) ($this->cfg['database'] ?? ''), $table, $column, $type, $value);
+    }
+
+    /** Authenticate and decode one opaque ENCRYPTED CLIENT result. */
+    public function decryptField(string $table, string $column, array $type, ?string $ciphertext): mixed
+    {
+        $provider = $this->cfg['fieldKeys'] ?? null;
+        if (!$provider instanceof FieldKeyProvider) {
+            throw new Exception('invalid_argument', 'field key provider is required');
+        }
+        return FieldEncryption::decrypt($provider, (string) ($this->cfg['database'] ?? ''), $table, $column, $type, $ciphertext);
     }
 
     /**
@@ -518,12 +540,31 @@ final class Client
     }
 
     /**
+     * Decodes an out-of-band Error frame (or reports a genuine protocol
+     * violation) for a call site checking "did I get what I expected?".
+     * writeErrReady on the server always sends Error then Ready — every
+     * call site funnels through here specifically so that trailing Ready
+     * is always drained in one place, rather than each of
+     * query/prepare/closeStatement/etc. having to remember to do it
+     * individually (a per-call-site version of this was exactly the shape
+     * of a real bug: readRows/prepare/closeStatement never drained it,
+     * leaving the connection permanently desynced after the first query
+     * error).
+     *
      * @param array{type: int, payload: string} $msg
      */
     public function unexpected(array $msg): Exception
     {
         if ($msg['type'] === self::TYPE_ERROR) {
-            return Protocol::decodeError($msg['payload']);
+            $err = Protocol::decodeError($msg['payload']);
+            try {
+                $this->expectReady();
+            } catch (\Throwable) {
+                // Best-effort: surface the original application error even
+                // if draining the trailing Ready itself fails (e.g. the
+                // connection is now genuinely broken).
+            }
+            return $err;
         }
         return new Exception('protocol', 'unexpected message type');
     }

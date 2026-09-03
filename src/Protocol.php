@@ -87,7 +87,7 @@ final class Protocol
     }
 
     /**
-     * @param array{version:int,flags:int,secret:string,database:string,user:string} $h
+     * @param array{version:int,flags:int,secret:string,database:string,user:string,realm?:string} $h
      */
     public static function encodeHello(array $h): string
     {
@@ -95,8 +95,16 @@ final class Protocol
         if (strlen($sec) !== 8) {
             $sec = str_pad(substr($sec, 0, 8), 8, "\x00");
         }
-        return self::u16le($h['version']) . self::u16le($h['flags']) . $sec
+        $out = self::u16le($h['version']) . self::u16le($h['flags']) . $sec
             . self::u16str($h['database']) . self::u16str($h['user']);
+        // Realm is an optional trailing field (M2-2): emitted only when
+        // selected, so a Hello with no realm is byte-identical to the
+        // pre-realm wire shape.
+        $realm = $h['realm'] ?? '';
+        if ($realm !== '') {
+            $out .= self::u16str($realm);
+        }
+        return $out;
     }
 
     /**
@@ -182,6 +190,27 @@ final class Protocol
             if (($v['kind'] ?? '') === 'decimal') {
                 return chr(Client::KIND_DECIMAL) . "\x00" . str_repeat("\x00", 5) . self::encodeDecimal((string) $v['value']);
             }
+            if (($v['kind'] ?? '') === 'blob') {
+                return chr(Client::KIND_BLOB) . "\x00" . str_repeat("\x00", 5) . self::u32bytes((string) $v['value'], Client::MAX_PACKET);
+            }
+            $intKinds = [
+                'int8' => [Client::KIND_INT8, -0x80, 0x7f],
+                'int16' => [Client::KIND_INT16, -0x8000, 0x7fff],
+                'int32' => [Client::KIND_INT32, -0x80000000, 0x7fffffff],
+                'int64' => [Client::KIND_INT64, PHP_INT_MIN, PHP_INT_MAX],
+            ];
+            if (isset($intKinds[$v['kind'] ?? ''])) {
+                return self::encodeInt($intKinds[$v['kind']], (int) $v['value']);
+            }
+            $uintKinds = [
+                'uint8' => Client::KIND_UINT8,
+                'uint16' => Client::KIND_UINT16,
+                'uint32' => Client::KIND_UINT32,
+                'uint64' => Client::KIND_UINT64,
+            ];
+            if (isset($uintKinds[$v['kind'] ?? ''])) {
+                return self::encodeUint($uintKinds[$v['kind']], $v['value']);
+            }
             $json = json_encode($v, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
             return chr(Client::KIND_STRING) . "\x00" . str_repeat("\x00", 5) . self::u32bytes($json, Client::MAX_PACKET);
         }
@@ -207,6 +236,7 @@ final class Protocol
                 return ['value' => self::formatUUID(substr($b, $off, 16)), 'next' => $off + 16, 'kind' => $kind];
             case Client::KIND_STRING:
             case Client::KIND_TEXT:
+            case Client::KIND_BLOB:
                 $got = self::readU32Bytes($b, $off, Client::MAX_PACKET);
                 return ['value' => $got['value'], 'next' => $got['next'], 'kind' => $kind];
             case Client::KIND_JSON:
@@ -223,6 +253,33 @@ final class Protocol
                 return ['value' => $dt, 'next' => $off + 8, 'kind' => $kind];
             case Client::KIND_BOOL:
                 return ['value' => ord($b[$off]) !== 0, 'next' => $off + 1, 'kind' => $kind];
+            case Client::KIND_INT8:
+                $v = ord($b[$off]);
+                return ['value' => $v >= 0x80 ? $v - 0x100 : $v, 'next' => $off + 1, 'kind' => $kind];
+            case Client::KIND_INT16:
+                $v = self::u16($b, $off);
+                return ['value' => $v >= 0x8000 ? $v - 0x10000 : $v, 'next' => $off + 2, 'kind' => $kind];
+            case Client::KIND_INT32:
+                $v = self::u32($b, $off);
+                return ['value' => $v >= 0x80000000 ? $v - (2 ** 32) : $v, 'next' => $off + 4, 'kind' => $kind];
+            case Client::KIND_INT64:
+                // PHP int is platform-width (64-bit on every mainstream
+                // build); a legacy 32-bit build cannot represent the full
+                // range (see docs/design-datatypes.md D2).
+                return ['value' => self::i64($b, $off), 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_UINT8:
+                return ['value' => ord($b[$off]), 'next' => $off + 1, 'kind' => $kind];
+            case Client::KIND_UINT16:
+                return ['value' => self::u16($b, $off), 'next' => $off + 2, 'kind' => $kind];
+            case Client::KIND_UINT32:
+                return ['value' => self::u32($b, $off), 'next' => $off + 4, 'kind' => $kind];
+            case Client::KIND_UINT64:
+                // Exposed as a native int when it fits PHP's signed 64-bit
+                // range (< 2^63), else as a decimal string (mirrors DECIMAL)
+                // — PHP has no unsigned 64-bit type, so a value at/above
+                // 2^63 cannot be a plain int without silently going negative
+                // (see docs/design-datatypes.md D3).
+                return ['value' => self::decodeUint64($b, $off), 'next' => $off + 8, 'kind' => $kind];
             case Client::KIND_VECTOR:
                 $dim = self::u16($b, $off);
                 $flag = ord($b[$off + 2]);
@@ -546,7 +603,7 @@ final class Protocol
         return $hdr . $body;
     }
 
-    private static function decToBytes(string $digits): string
+    public static function decToBytes(string $digits): string
     {
         if ($digits === '0') {
             return '';
@@ -570,7 +627,7 @@ final class Protocol
         return $out;
     }
 
-    private static function bytesToDec(string $bytes): string
+    public static function bytesToDec(string $bytes): string
     {
         $s = '0';
         $n = strlen($bytes);
@@ -599,13 +656,15 @@ final class Protocol
 
     private static function i64(string $b, int $off): int
     {
-        $lo = self::u32($b, $off);
-        $hi = self::u32($b, $off + 4);
-        $u = $hi * (1 << 32) + $lo;
-        if ($hi >= 0x80000000) {
-            return $u - 2 ** 64;
-        }
-        return $u;
+        // Fixed while implementing D2 (Datatype expansion track): the old
+        // hi*2^32+lo formula overflows into float for any value at/above
+        // magnitude 2^63 (silently corrupting e.g. exactly PHP_INT_MIN),
+        // because the pre-clamp arithmetic runs before the sign fixup.
+        // unpack('P', ...) instead reinterprets the 8 bytes as a native
+        // 64-bit register directly (no arithmetic, so no overflow) — PHP
+        // int is signed 64-bit natively, so this returns the correct
+        // signed value across the full range.
+        return unpack('P', substr($b, $off, 8))[1];
     }
 
     private static function u64fromDec(string $dec): string
@@ -613,5 +672,97 @@ final class Protocol
         $bytes = self::decToBytes($dec);
         $bytes = str_pad($bytes, 8, "\x00", STR_PAD_LEFT);
         return strrev(substr($bytes, -8)); // LE
+    }
+
+    /**
+     * encodeInt builds an explicit fixed-width int parameter (D2, Datatype
+     * expansion track). A bare PHP int still defaults to KIND_DECIMAL (see
+     * encodeParam) and coerces server-side into any numeric column, so this
+     * is only needed to pin an exact wire width. Native PHP int is
+     * platform-width (64-bit on every mainstream build; a legacy 32-bit PHP
+     * build cannot represent the full INT64 range at all — not solvable
+     * within this driver without arbitrary-precision string arithmetic).
+     *
+     * @param array{0: int, 1: int, 2: int} $spec [kindTag, min, max]
+     */
+    private static function encodeInt(array $spec, int $value): string
+    {
+        [$kindTag, $min, $max] = $spec;
+        if ($value < $min || $value > $max) {
+            throw new Exception('invalid_argument', 'integer out of range');
+        }
+        $body = match ($kindTag) {
+            Client::KIND_INT8 => chr($value & 0xFF),
+            Client::KIND_INT16 => pack('v', $value & 0xFFFF),
+            Client::KIND_INT32 => pack('V', $value & 0xFFFFFFFF),
+            // 'P': unsigned 64-bit LE — pack() takes the raw bit pattern of
+            // the native (signed) PHP int, so a negative value round-trips
+            // correctly as two's complement.
+            default => pack('P', $value),
+        };
+        return chr($kindTag) . "\x00" . str_repeat("\x00", 5) . $body;
+    }
+
+    /**
+     * encodeUint builds an explicit fixed-width unsigned int parameter (D3,
+     * Datatype expansion track). UINT8/16/32 always fit in PHP's native
+     * 64-bit signed int; UINT64 additionally accepts a decimal digit string
+     * for magnitudes above PHP_INT_MAX, since PHP has no unsigned 64-bit
+     * type (mirrors how DECIMAL values are passed as strings).
+     */
+    private static function encodeUint(int $kindTag, int|string $value): string
+    {
+        $body = match ($kindTag) {
+            Client::KIND_UINT8, Client::KIND_UINT16, Client::KIND_UINT32 => self::encodeNarrowUint($kindTag, $value),
+            default => self::encodeUint64($value),
+        };
+        return chr($kindTag) . "\x00" . str_repeat("\x00", 5) . $body;
+    }
+
+    private static function encodeNarrowUint(int $kindTag, int|string $value): string
+    {
+        if (!is_int($value)) {
+            throw new Exception('invalid_argument', 'uint value must be an integer');
+        }
+        $max = match ($kindTag) {
+            Client::KIND_UINT8 => 0xFF,
+            Client::KIND_UINT16 => 0xFFFF,
+            default => 0xFFFFFFFF,
+        };
+        if ($value < 0 || $value > $max) {
+            throw new Exception('invalid_argument', 'integer out of range');
+        }
+        return match ($kindTag) {
+            Client::KIND_UINT8 => chr($value),
+            Client::KIND_UINT16 => pack('v', $value),
+            default => pack('V', $value),
+        };
+    }
+
+    private static function encodeUint64(int|string $value): string
+    {
+        if (is_int($value)) {
+            if ($value < 0) {
+                throw new Exception('invalid_argument', 'integer out of range');
+            }
+            return pack('P', $value);
+        }
+        if (!preg_match('/^\d+$/D', $value)) {
+            throw new Exception('invalid_argument', 'invalid uint64 value');
+        }
+        $bytes = self::decToBytes($value);
+        if (strlen($bytes) > 8) {
+            throw new Exception('invalid_argument', 'integer out of range');
+        }
+        return strrev(str_pad($bytes, 8, "\x00", STR_PAD_LEFT));
+    }
+
+    private static function decodeUint64(string $b, int $off): int|string
+    {
+        $raw = substr($b, $off, 8);
+        if ((ord($raw[7]) & 0x80) === 0) {
+            return unpack('P', $raw)[1];
+        }
+        return self::bytesToDec(strrev($raw));
     }
 }
