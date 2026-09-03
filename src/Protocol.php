@@ -87,6 +87,45 @@ final class Protocol
     }
 
     /**
+     * appendEnumLabels/readEnumLabels carry an ENUM Type's declared label
+     * list on the wire, matching internal/protocol/value.go's
+     * appendEnumLabels/readEnumLabels exactly (docs/design-datatypes.md
+     * D11): ENUM is the first D-track type whose Type needs variable-length
+     * metadata beyond the fixed 5/6-byte Precision/Scale/VecElem shape every
+     * other type fits into.
+     */
+    public static function appendEnumLabels(array $labels): string
+    {
+        $out = self::u16le(count($labels));
+        foreach ($labels as $l) {
+            $out .= self::u16str((string) $l, Client::MAX_ENUM_LABEL_BYTES);
+        }
+        return $out;
+    }
+
+    /**
+     * @return array{value: array<int, string>, next: int}
+     */
+    public static function readEnumLabels(string $b, int $off): array
+    {
+        if ($off + 2 > strlen($b)) {
+            throw new Exception('protocol', 'truncated enum label count');
+        }
+        $n = self::u16($b, $off);
+        if ($n > Client::MAX_ENUM_LABELS) {
+            throw new Exception('protocol', 'enum label count exceeds limit');
+        }
+        $off += 2;
+        $labels = [];
+        for ($i = 0; $i < $n; $i++) {
+            $got = self::readU16String($b, $off, Client::MAX_ENUM_LABEL_BYTES);
+            $labels[] = $got['value'];
+            $off = $got['next'];
+        }
+        return ['value' => $labels, 'next' => $off];
+    }
+
+    /**
      * @param array{version:int,flags:int,secret:string,database:string,user:string,realm?:string} $h
      */
     public static function encodeHello(array $h): string
@@ -171,8 +210,8 @@ final class Protocol
             return chr(Client::KIND_STRING) . "\x00" . str_repeat("\x00", 5) . self::u32bytes($v, Client::MAX_PACKET);
         }
         if ($v instanceof \DateTimeInterface) {
-            $ns = (string) ((int) $v->format('U') * 1_000_000_000 + ((int) $v->format('u')) * 1000);
-            return chr(Client::KIND_TIMESTAMPTZ) . "\x00" . str_repeat("\x00", 5) . self::u64fromDec($ns);
+            $ns = (int) $v->format('U') * 1_000_000_000 + ((int) $v->format('u')) * 1000;
+            return chr(Client::KIND_TIMESTAMPTZ) . "\x00" . str_repeat("\x00", 5) . self::i64le($ns);
         }
         if (is_array($v)) {
             if (array_is_list($v) && $v !== [] && array_reduce($v, static fn($ok, $x) => $ok && is_numeric($x), true)) {
@@ -211,6 +250,65 @@ final class Protocol
             if (isset($uintKinds[$v['kind'] ?? ''])) {
                 return self::encodeUint($uintKinds[$v['kind']], $v['value']);
             }
+            if (($v['kind'] ?? '') === 'enum') {
+                return self::encodeEnum((string) $v['value'], (array) $v['labels']);
+            }
+            if (($v['kind'] ?? '') === 'date') {
+                // A DateTimeInterface's UTC calendar day, or a raw signed
+                // day-count integer (docs/design-datatypes.md D5). Floor
+                // division, not intdiv()'s truncation-toward-zero: a
+                // pre-1970 instant's epoch-seconds is negative, and intdiv
+                // would round a negative non-multiple of 86400 toward 0
+                // (one day too late) instead of toward -Infinity.
+                if ($v['value'] instanceof \DateTimeInterface) {
+                    $sec = (int) $v['value']->setTimezone(new \DateTimeZone('UTC'))->format('U');
+                    $dayCount = intdiv($sec, 86400);
+                    if ($sec % 86400 !== 0 && $sec < 0) {
+                        $dayCount--;
+                    }
+                } else {
+                    $dayCount = (int) $v['value'];
+                }
+                return chr(Client::KIND_DATE) . "\x00" . str_repeat("\x00", 5) . pack('V', $dayCount & 0xFFFFFFFF);
+            }
+            if (($v['kind'] ?? '') === 'time') {
+                // Nanoseconds since midnight (PHP has no time-only type;
+                // always non-negative, so the signed/unsigned distinction
+                // in i64le doesn't matter here — used for consistency).
+                return chr(Client::KIND_TIME) . "\x00" . str_repeat("\x00", 5) . self::i64le((int) $v['value']);
+            }
+            if (($v['kind'] ?? '') === 'timestamp') {
+                // Naive/no-timezone TIMESTAMP: shares TimestampTZ's exact
+                // wire shape, tagged with a different Kind — a bare
+                // DateTimeInterface always means TIMESTAMPTZ (above), so
+                // this wrapper is required to select the naive Kind
+                // (docs/design-datatypes.md D7).
+                if ($v['value'] instanceof \DateTimeInterface) {
+                    $dt = $v['value']->setTimezone(new \DateTimeZone('UTC'));
+                    $ns = (int) $dt->format('U') * 1_000_000_000 + ((int) $dt->format('u')) * 1000;
+                } else {
+                    $ns = (int) $v['value'];
+                }
+                return chr(Client::KIND_TIMESTAMP) . "\x00" . str_repeat("\x00", 5) . self::i64le($ns);
+            }
+            if (($v['kind'] ?? '') === 'float32') {
+                return chr(Client::KIND_FLOAT32) . "\x00" . str_repeat("\x00", 5) . pack('g', (float) $v['value']);
+            }
+            if (($v['kind'] ?? '') === 'float64') {
+                return chr(Client::KIND_FLOAT64) . "\x00" . str_repeat("\x00", 5) . pack('e', (float) $v['value']);
+            }
+            if (($v['kind'] ?? '') === 'interval') {
+                // months(i32 LE) + days(i32 LE) + nanos(i64 LE) — D6,
+                // Datatype expansion track. A plain string still works as
+                // an INTERVAL param for INSERT/UPDATE column assignment
+                // (server-side Coerce) but not inside an arithmetic
+                // expression like `dur + $1`, which requires the actual
+                // wire Kind.
+                $months = (int) $v['months'];
+                $days = (int) $v['days'];
+                return chr(Client::KIND_INTERVAL) . "\x00" . str_repeat("\x00", 5)
+                    . pack('V', $months & 0xFFFFFFFF) . pack('V', $days & 0xFFFFFFFF) . self::i64le((int) $v['nanos']);
+            }
             $json = json_encode($v, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
             return chr(Client::KIND_STRING) . "\x00" . str_repeat("\x00", 5) . self::u32bytes($json, Client::MAX_PACKET);
         }
@@ -228,8 +326,14 @@ final class Protocol
         $kind = ord($b[$off]);
         $flags = ord($b[$off + 1]);
         $off += 7;
+        $enumLabels = null;
+        if ($kind === Client::KIND_ENUM) {
+            $got = self::readEnumLabels($b, $off);
+            $enumLabels = $got['value'];
+            $off = $got['next'];
+        }
         if ($flags & Client::FLAG_NULL) {
-            return ['value' => null, 'next' => $off, 'kind' => $kind];
+            return ['value' => null, 'next' => $off, 'kind' => $kind, 'labels' => $enumLabels];
         }
         switch ($kind) {
             case Client::KIND_UUID:
@@ -246,11 +350,43 @@ final class Protocol
                 $got = self::readU32Bytes($b, $off, Client::MAX_PACKET);
                 return ['value' => self::decodeDecimal($got['value']), 'next' => $got['next'], 'kind' => $kind];
             case Client::KIND_TIMESTAMPTZ:
-                $ns = self::i64($b, $off);
-                $sec = intdiv($ns, 1_000_000_000);
-                $usec = intdiv($ns % 1_000_000_000, 1000);
+                [$sec, $usec] = self::splitNanos(self::i64($b, $off));
                 $dt = \DateTimeImmutable::createFromFormat('U.u', sprintf('%d.%06d', $sec, $usec), new \DateTimeZone('UTC'));
                 return ['value' => $dt, 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_TIMESTAMP:
+                // Naive/no-timezone: same wire shape as TIMESTAMPTZ
+                // (docs/design-datatypes.md D7).
+                [$sec, $usec] = self::splitNanos(self::i64($b, $off));
+                $dt = \DateTimeImmutable::createFromFormat('U.u', sprintf('%d.%06d', $sec, $usec), new \DateTimeZone('UTC'));
+                return ['value' => $dt, 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_DATE:
+                $day = self::u32($b, $off);
+                $day = $day >= 0x80000000 ? $day - (2 ** 32) : $day;
+                $dt = (new \DateTimeImmutable('@0'))->setTimezone(new \DateTimeZone('UTC'))->modify("$day days");
+                return ['value' => $dt, 'next' => $off + 4, 'kind' => $kind];
+            case Client::KIND_TIME:
+                // Nanoseconds since midnight, always non-negative.
+                $ns = self::i64($b, $off);
+                return ['value' => $ns, 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_CHAR:
+            case Client::KIND_VARCHAR:
+                $got = self::readU32Bytes($b, $off, Client::MAX_PACKET);
+                return ['value' => $got['value'], 'next' => $got['next'], 'kind' => $kind];
+            case Client::KIND_FLOAT32:
+                return ['value' => unpack('g', substr($b, $off, 4))[1], 'next' => $off + 4, 'kind' => $kind];
+            case Client::KIND_FLOAT64:
+                return ['value' => unpack('e', substr($b, $off, 8))[1], 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_INTERVAL:
+                $months = self::u32($b, $off);
+                $months = $months >= 0x80000000 ? $months - (2 ** 32) : $months;
+                $days = self::u32($b, $off + 4);
+                $days = $days >= 0x80000000 ? $days - (2 ** 32) : $days;
+                $nanos = self::i64($b, $off + 8);
+                return [
+                    'value' => ['months' => $months, 'days' => $days, 'nanos' => $nanos],
+                    'next' => $off + 16,
+                    'kind' => $kind,
+                ];
             case Client::KIND_BOOL:
                 return ['value' => ord($b[$off]) !== 0, 'next' => $off + 1, 'kind' => $kind];
             case Client::KIND_INT8:
@@ -280,6 +416,15 @@ final class Protocol
                 // 2^63 cannot be a plain int without silently going negative
                 // (see docs/design-datatypes.md D3).
                 return ['value' => self::decodeUint64($b, $off), 'next' => $off + 8, 'kind' => $kind];
+            case Client::KIND_ENUM:
+                if ($off + 2 > strlen($b)) {
+                    throw new Exception('protocol', 'truncated enum');
+                }
+                $ord = self::u16($b, $off);
+                if ($ord >= count($enumLabels)) {
+                    throw new Exception('protocol', 'ENUM ordinal out of range');
+                }
+                return ['value' => $enumLabels[$ord], 'next' => $off + 2, 'kind' => $kind, 'labels' => $enumLabels];
             case Client::KIND_VECTOR:
                 $dim = self::u16($b, $off);
                 $flag = ord($b[$off + 2]);
@@ -351,7 +496,7 @@ final class Protocol
     }
 
     /**
-     * @return list<array{name:string,kind:int}>
+     * @return list<array{name:string,kind:int,labels?:array<int,string>}>
      */
     public static function decodeRowDesc(string $b): array
     {
@@ -361,8 +506,15 @@ final class Protocol
         for ($i = 0; $i < $n; $i++) {
             $name = self::readU16String($b, $off, Client::MAX_NAME);
             $off = $name['next'];
-            $cols[] = ['name' => $name['value'], 'kind' => ord($b[$off])];
+            $kind = ord($b[$off]);
+            $col = ['name' => $name['value'], 'kind' => $kind];
             $off += 6;
+            if ($kind === Client::KIND_ENUM) {
+                $got = self::readEnumLabels($b, $off);
+                $col['labels'] = $got['value'];
+                $off = $got['next'];
+            }
+            $cols[] = $col;
         }
         return $cols;
     }
@@ -675,6 +827,52 @@ final class Protocol
     }
 
     /**
+     * i64le packs a native PHP int (already signed 64-bit) as 8
+     * little-endian bytes — the mirror of i64()'s unpack('P', ...), correct
+     * for the full signed range including negative values, since 'P' packs
+     * the int's own two's-complement bit pattern rather than reinterpreting
+     * it as unsigned magnitude.
+     *
+     * Found and fixed while implementing D5/D7 (Datatype expansion track):
+     * every i64-range caller (TIMESTAMPTZ, and the new naive TIMESTAMP/TIME)
+     * previously round-tripped through u64fromDec()/decToBytes(), which
+     * treats its input as an unsigned decimal digit string — decToBytes
+     * silently mistreats a leading '-' as the digit 0 (PHP's (int) cast on
+     * a non-digit character), so any negative nanosecond value (any
+     * pre-1970 TIMESTAMPTZ/TIMESTAMP) encoded to the wrong bytes with no
+     * error. u64fromDec()/decToBytes() remain correct and necessary for
+     * UINT64, whose magnitude can exceed PHP_INT_MAX and genuinely needs
+     * unsigned big-number arithmetic; i64-range values never need that.
+     */
+    private static function i64le(int $n): string
+    {
+        return pack('P', $n);
+    }
+
+    /**
+     * splitNanos splits epoch nanoseconds into (seconds, microseconds) with
+     * microseconds always in [0, 999999] — floor division, not intdiv()'s
+     * truncation-toward-zero and PHP's dividend-signed %, which for a
+     * negative $ns (any pre-1970 instant) produced a negative $usec and
+     * made DateTimeImmutable::createFromFormat('U.u', ...) silently return
+     * false. Found and fixed alongside the i64le encode-side bug above,
+     * same root cause (D5/D7, Datatype expansion track): a pre-1970
+     * TIMESTAMPTZ never worked correctly in this driver.
+     *
+     * @return array{0: int, 1: int}
+     */
+    private static function splitNanos(int $ns): array
+    {
+        $sec = intdiv($ns, 1_000_000_000);
+        $rem = $ns % 1_000_000_000;
+        if ($rem < 0) {
+            $rem += 1_000_000_000;
+            $sec--;
+        }
+        return [$sec, intdiv($rem, 1000)];
+    }
+
+    /**
      * encodeInt builds an explicit fixed-width int parameter (D2, Datatype
      * expansion track). A bare PHP int still defaults to KIND_DECIMAL (see
      * encodeParam) and coerces server-side into any numeric column, so this
@@ -701,6 +899,25 @@ final class Protocol
             default => pack('P', $value),
         };
         return chr($kindTag) . "\x00" . str_repeat("\x00", 5) . $body;
+    }
+
+    /**
+     * encodeEnum builds an explicit ENUM parameter (D11, Datatype expansion
+     * track). Ordinary INSERT/UPDATE params can just pass a plain PHP
+     * string — the server coerces STRING -> ENUM against the destination
+     * column, same as a SQL string literal. This wrapper exists for
+     * explicit round-tripping and mirrors encodeInt/encodeUint's precedent.
+     *
+     * @param array<int, string> $labels
+     */
+    private static function encodeEnum(string $label, array $labels): string
+    {
+        $ord = array_search($label, $labels, true);
+        if ($ord === false) {
+            throw new Exception('invalid_argument', 'value is not a member of the ENUM label set');
+        }
+        return chr(Client::KIND_ENUM) . "\x00" . str_repeat("\x00", 5)
+            . self::appendEnumLabels($labels) . self::u16le((int) $ord);
     }
 
     /**

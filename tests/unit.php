@@ -290,6 +290,107 @@ try {
     // expected
 }
 
+// D11 (Datatype expansion track): ENUM params carry their declared label
+// list alongside the value (docs/design-datatypes.md D11).
+$enumLabels = ['small', 'medium', 'large'];
+$enumGot = Protocol::decodeValue(Protocol::encodeParam(['kind' => 'enum', 'value' => 'medium', 'labels' => $enumLabels]), 0);
+if ($enumGot['kind'] !== Client::KIND_ENUM || $enumGot['value'] !== 'medium' || $enumGot['labels'] !== $enumLabels) {
+    fail('enum param -> ' . var_export($enumGot, true));
+}
+try {
+    Protocol::encodeParam(['kind' => 'enum', 'value' => 'huge', 'labels' => $enumLabels]);
+    fail('expected a non-member ENUM label to be rejected');
+} catch (Exception $e) {
+    // expected
+}
+// decodeRowDesc parses the same label-list framing for a column header.
+$rowDesc = "\x01\x00" . Protocol::u16str('sz') . chr(Client::KIND_ENUM) . str_repeat("\x00", 5) . Protocol::appendEnumLabels($enumLabels);
+$cols = Protocol::decodeRowDesc($rowDesc);
+if (count($cols) !== 1 || $cols[0]['kind'] !== Client::KIND_ENUM || $cols[0]['labels'] !== $enumLabels) {
+    fail('enum row desc -> ' . var_export($cols, true));
+}
+
+// D5/D7/D8 (Datatype expansion track): DATE, TIME, naive TIMESTAMP,
+// FLOAT32/FLOAT64 param round-trip, including two real bugs found and
+// fixed while implementing this: negative-nanosecond TIMESTAMPTZ encode
+// (u64fromDec mistreated a leading '-' as digit 0) and decode (intdiv's
+// truncation-toward-zero + PHP's dividend-signed % produced a negative
+// usec, so DateTimeImmutable::createFromFormat silently returned false).
+$preEpoch = new DateTimeImmutable('1969-12-31T23:59:59.500000Z');
+$gotPre = Protocol::decodeValue(Protocol::encodeParam($preEpoch), 0);
+if ($gotPre['value'] === false || $gotPre['value']->format('Y-m-d H:i:s.u') !== '1969-12-31 23:59:59.500000') {
+    fail('pre-1970 TIMESTAMPTZ round trip -> ' . var_export($gotPre['value'], true));
+}
+
+$dateVal = new DateTimeImmutable('2024-01-15T00:00:00Z');
+$gotDate = Protocol::decodeValue(Protocol::encodeParam(['kind' => 'date', 'value' => $dateVal]), 0);
+if ($gotDate['kind'] !== Client::KIND_DATE || $gotDate['value']->format('Y-m-d') !== '2024-01-15') {
+    fail('date round trip -> ' . var_export($gotDate, true));
+}
+$datePreEpoch = new DateTimeImmutable('1969-12-31T00:00:00Z');
+$gotDatePre = Protocol::decodeValue(Protocol::encodeParam(['kind' => 'date', 'value' => $datePreEpoch]), 0);
+if ($gotDatePre['value']->format('Y-m-d') !== '1969-12-31') {
+    fail('pre-1970 date round trip -> ' . var_export($gotDatePre['value'], true));
+}
+
+$nsInDay = (23 * 3600 + 59 * 60 + 59) * 1_000_000_000 + 999_000_000;
+$gotTime = Protocol::decodeValue(Protocol::encodeParam(['kind' => 'time', 'value' => $nsInDay]), 0);
+if ($gotTime['kind'] !== Client::KIND_TIME || $gotTime['value'] !== $nsInDay) {
+    fail('time round trip -> ' . var_export($gotTime, true));
+}
+
+$naiveTs = new DateTimeImmutable('2024-06-15T10:30:00Z');
+$gotNaive = Protocol::decodeValue(Protocol::encodeParam(['kind' => 'timestamp', 'value' => $naiveTs]), 0);
+if ($gotNaive['kind'] !== Client::KIND_TIMESTAMP || $gotNaive['value']->format('Y-m-d H:i:s') !== '2024-06-15 10:30:00') {
+    fail('naive timestamp round trip -> ' . var_export($gotNaive, true));
+}
+// A bare DateTimeInterface still defaults to TIMESTAMPTZ.
+if (Protocol::decodeValue(Protocol::encodeParam($naiveTs), 0)['kind'] !== Client::KIND_TIMESTAMPTZ) {
+    fail('bare DateTimeInterface should default to TIMESTAMPTZ');
+}
+
+foreach (['float32' => Client::KIND_FLOAT32, 'float64' => Client::KIND_FLOAT64] as $which => $wantKind) {
+    $got = Protocol::decodeValue(Protocol::encodeParam(['kind' => $which, 'value' => 1.5]), 0);
+    if ($got['kind'] !== $wantKind || $got['value'] !== 1.5) {
+        fail("$which round trip -> " . var_export($got, true));
+    }
+    // NaN/Infinity are valid FLOAT values (unlike the bare-number -> Decimal path).
+    $gotNan = Protocol::decodeValue(Protocol::encodeParam(['kind' => $which, 'value' => NAN]), 0);
+    if (!is_nan($gotNan['value'])) {
+        fail("$which NaN round trip -> " . var_export($gotNan, true));
+    }
+    $gotInf = Protocol::decodeValue(Protocol::encodeParam(['kind' => $which, 'value' => INF]), 0);
+    if ($gotInf['value'] !== INF) {
+        fail("$which Infinity round trip -> " . var_export($gotInf, true));
+    }
+}
+
+// CHAR/VARCHAR decode as plain strings (a client-side write goes through
+// plain STRING/TEXT, server-coerced — no encode wrapper needed).
+$charRaw = chr(Client::KIND_CHAR) . "\x00" . str_repeat("\x00", 5) . pack('V', 5) . 'ab   ';
+$gotChar = Protocol::decodeValue($charRaw, 0);
+if ($gotChar['value'] !== 'ab   ') {
+    fail('char decode -> ' . var_export($gotChar, true));
+}
+
+// D6 (Datatype expansion track): INTERVAL param round-trip, including a
+// negative nanos component (uses the same i64le encode/splitNanos-adjacent
+// fix already verified above for TIMESTAMPTZ/DATE).
+$gotInterval = Protocol::decodeValue(
+    Protocol::encodeParam(['kind' => 'interval', 'months' => 14, 'days' => 3, 'nanos' => 4 * 3_600_000_000_000]),
+    0
+);
+if ($gotInterval['kind'] !== Client::KIND_INTERVAL || $gotInterval['value'] !== ['months' => 14, 'days' => 3, 'nanos' => 4 * 3_600_000_000_000]) {
+    fail('interval round trip -> ' . var_export($gotInterval, true));
+}
+$gotNegInterval = Protocol::decodeValue(
+    Protocol::encodeParam(['kind' => 'interval', 'months' => 0, 'days' => 0, 'nanos' => -3_600_000_000_000]),
+    0
+);
+if ($gotNegInterval['value']['nanos'] !== -3_600_000_000_000) {
+    fail('negative interval nanos round trip -> ' . var_export($gotNegInterval, true));
+}
+
 $body = Protocol::encodeDecimal('-12.50');
 $raw = substr($body, 4);
 if (Protocol::decodeDecimal($raw) !== '-12.50') {

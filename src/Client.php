@@ -15,6 +15,8 @@ final class Client
     public const MAX_SQL = 1 << 20;
     public const MAX_NAME = 256;
     public const MAX_PARAMS = 256;
+    public const MAX_ENUM_LABELS = 4096;
+    public const MAX_ENUM_LABEL_BYTES = 255;
 
     public const TYPE_HELLO = 1;
     public const TYPE_HELLO_OK = 2;
@@ -73,6 +75,15 @@ final class Client
     public const KIND_UINT16 = 20;
     public const KIND_UINT32 = 21;
     public const KIND_UINT64 = 22;
+    public const KIND_DATE = 23;
+    public const KIND_TIME = 24;
+    public const KIND_CHAR = 25;
+    public const KIND_VARCHAR = 26;
+    public const KIND_TIMESTAMP = 27;
+    public const KIND_FLOAT32 = 28;
+    public const KIND_FLOAT64 = 29;
+    public const KIND_ENUM = 30;
+    public const KIND_INTERVAL = 31;
 
     /** @var resource */
     private $sock;
