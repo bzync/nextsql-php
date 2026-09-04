@@ -84,6 +84,14 @@ final class Client
     public const KIND_FLOAT64 = 29;
     public const KIND_ENUM = 30;
     public const KIND_INTERVAL = 31;
+    public const KIND_STRUCT = 32;
+    public const KIND_ARRAY = 33;
+    public const KIND_MAP = 34;
+    public const KIND_GEOMETRY = 35;
+    public const KIND_GEOGRAPHY = 36;
+    public const MAX_NEST_DEPTH = 8;
+    public const MAX_STRUCT_FIELDS = 128;
+    public const MAX_COLLECTION_LEN = 1048576;
 
     /** @var resource */
     private $sock;

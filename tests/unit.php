@@ -489,4 +489,38 @@ if (substr($helloWithRealm, 0, strlen($helloNoRealm)) !== $helloNoRealm) {
     fail('hello with realm must extend the no-realm prefix unchanged');
 }
 
+// Collections track (D9): STRUCT / ARRAY / MAP param round-trip.
+$arr = Protocol::decodeValue(Protocol::encodeParam(["a", "b", "c"]), 0);
+if ($arr["kind"] !== Client::KIND_ARRAY || $arr["value"] !== ["a", "b", "c"]) {
+    fail("array round trip -> " . var_export($arr, true));
+}
+$arrN = Protocol::decodeValue(Protocol::encodeParam(["a", null, "c"]), 0);
+if ($arrN["value"] !== ["a", null, "c"]) {
+    fail("array-with-null round trip -> " . var_export($arrN, true));
+}
+$mp = Protocol::decodeValue(Protocol::encodeParam(["kind" => "map", "value" => [["x", "hi"]]]), 0);
+if ($mp["kind"] !== Client::KIND_MAP || $mp["value"] !== [["x", "hi"]]) {
+    fail("map round trip -> " . var_export($mp, true));
+}
+$st = Protocol::decodeValue(Protocol::encodeParam(["kind" => "struct", "value" => [["street", "Main"], ["zip", "90210"]]]), 0);
+if ($st["kind"] !== Client::KIND_STRUCT || $st["value"]["street"] !== "Main") {
+    fail("struct round trip -> " . var_export($st, true));
+}
+$nested = Protocol::decodeValue(Protocol::encodeParam(["kind" => "struct", "value" => [["n", "bob"], ["t", ["x", "y"]]]]), 0);
+if ($nested["value"]["t"] !== ["x", "y"]) {
+    fail("nested struct round trip -> " . var_export($nested, true));
+}
+
+// Spatial track: EWKB decode / encode round-trip (S4).
+$ewkb = chr(1) . pack("V", 1 | 0x20000000) . pack("V", 4326) . pack("e", 1.5) . pack("e", 2.5);
+$wire = chr(Client::KIND_GEOMETRY) . "\x00" . str_repeat("\x00", 5) . pack("V", strlen($ewkb)) . $ewkb;
+$geoGot = Protocol::decodeValue($wire, 0);
+if ($geoGot["next"] !== strlen($wire) || $geoGot["value"] !== ["type" => "Point", "srid" => 4326, "coordinates" => [1.5, 2.5]]) {
+    fail("spatial EWKB decode -> " . var_export($geoGot, true));
+}
+$geoEnc = Protocol::encodeParam(["kind" => "geometry", "wkt" => "POINT(1 2)", "srid" => 4326]);
+if (Protocol::decodeValue($geoEnc, 0)["value"] !== "SRID=4326;POINT(1 2)") {
+    fail("spatial geometry param encode");
+}
+
 fwrite(STDOUT, "ok\n");

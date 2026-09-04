@@ -125,6 +125,377 @@ final class Protocol
         return ['value' => $labels, 'next' => $off];
     }
 
+    // --- Collections (STRUCT / ARRAY / MAP), docs/design-collections.md ------
+
+    /**
+     * @return array{type: array<string,mixed>, next: int}
+     */
+    public static function readTypeFull(string $b, int $off, int $depth): array
+    {
+        if ($off + 6 > strlen($b)) {
+            throw new Exception('protocol', 'truncated type');
+        }
+        $t = [
+            'kind' => ord($b[$off]),
+            'precision' => self::u16($b, $off + 1),
+            'scale' => self::u16($b, $off + 3),
+            'elem' => ord($b[$off + 5]),
+        ];
+        $next = self::readNestedDescriptor($b, $off + 6, $t, $depth);
+        return ['type' => $t, 'next' => $next];
+    }
+
+    /** @param array<string,mixed> $t */
+    public static function readNestedDescriptor(string $b, int $off, array &$t, int $depth): int
+    {
+        if ($depth > Client::MAX_NEST_DEPTH + 1) {
+            throw new Exception('protocol', 'collection type nesting too deep');
+        }
+        $kind = $t['kind'];
+        if ($kind === Client::KIND_ENUM) {
+            $got = self::readEnumLabels($b, $off);
+            $t['labels'] = $got['value'];
+            return $got['next'];
+        }
+        if ($kind === Client::KIND_ARRAY) {
+            $e = self::readTypeFull($b, $off, $depth + 1);
+            $t['elemType'] = $e['type'];
+            return $e['next'];
+        }
+        if ($kind === Client::KIND_MAP) {
+            $k = self::readTypeFull($b, $off, $depth + 1);
+            $v = self::readTypeFull($b, $k['next'], $depth + 1);
+            $t['keyType'] = $k['type'];
+            $t['elemType'] = $v['type'];
+            return $v['next'];
+        }
+        if ($kind === Client::KIND_STRUCT) {
+            if ($off + 2 > strlen($b)) {
+                throw new Exception('protocol', 'truncated struct field count');
+            }
+            $n = self::u16($b, $off);
+            if ($n === 0 || $n > Client::MAX_STRUCT_FIELDS) {
+                throw new Exception('protocol', 'struct field count out of range');
+            }
+            $off += 2;
+            $fields = [];
+            for ($i = 0; $i < $n; $i++) {
+                $name = self::readU16String($b, $off, 255);
+                $off = $name['next'];
+                $ft = self::readTypeFull($b, $off, $depth + 1);
+                $off = $ft['next'];
+                $fields[] = ['name' => $name['value'], 'type' => $ft['type']];
+            }
+            $t['fields'] = $fields;
+            return $off;
+        }
+        return $off;
+    }
+
+    /**
+     * @param array<string,mixed> $t
+     * @return array{value: mixed, next: int}
+     */
+    public static function decodePayload(string $b, int $off, array $t): array
+    {
+        $kind = $t['kind'];
+        if ($kind === Client::KIND_STRUCT || $kind === Client::KIND_ARRAY || $kind === Client::KIND_MAP) {
+            return self::decodeCollectionPayload($b, $off, $t);
+        }
+        $header = chr($kind) . "\x00" . str_repeat("\x00", 5);
+        if ($kind === Client::KIND_ENUM) {
+            $header .= self::appendEnumLabels($t['labels'] ?? []);
+        }
+        $synthetic = $header . substr($b, $off);
+        $got = self::decodeValue($synthetic, 0);
+        return ['value' => $got['value'], 'next' => $off + ($got['next'] - strlen($header))];
+    }
+
+    /**
+     * @param array<string,mixed> $t
+     * @return array{value: mixed, next: int}
+     */
+    public static function decodeCollectionPayload(string $b, int $off, array $t): array
+    {
+        if ($off + 4 > strlen($b)) {
+            throw new Exception('protocol', 'truncated collection');
+        }
+        $bodyLen = self::u32($b, $off);
+        $bodyEnd = $off + 4 + $bodyLen;
+        if ($bodyEnd > strlen($b)) {
+            throw new Exception('protocol', 'truncated collection body');
+        }
+        $p = $off + 4;
+        $n = self::u32($b, $p);
+        $p += 4;
+        if ($n > 2 * Client::MAX_COLLECTION_LEN + 2 || $n > $bodyLen) {
+            throw new Exception('protocol', 'collection member count out of range');
+        }
+        $nb = intdiv($n + 7, 8);
+        $nulls = substr($b, $p, $nb);
+        $p += $nb;
+        $kind = $t['kind'];
+        $members = [];
+        for ($i = 0; $i < $n; $i++) {
+            if ((ord($nulls[intdiv($i, 8)]) & (1 << ($i % 8))) !== 0) {
+                $members[] = null;
+                continue;
+            }
+            if ($kind === Client::KIND_STRUCT) {
+                $mt = $t['fields'][$i]['type'];
+            } elseif ($kind === Client::KIND_ARRAY) {
+                $mt = $t['elemType'];
+            } else {
+                $mt = ($i % 2 === 0) ? $t['keyType'] : $t['elemType'];
+            }
+            $got = self::decodePayload($b, $p, $mt);
+            $p = $got['next'];
+            $members[] = $got['value'];
+        }
+        if ($kind === Client::KIND_STRUCT) {
+            $out = [];
+            foreach ($t['fields'] as $i => $f) {
+                $out[$f['name']] = $members[$i];
+            }
+            return ['value' => $out, 'next' => $bodyEnd];
+        }
+        if ($kind === Client::KIND_ARRAY) {
+            return ['value' => $members, 'next' => $bodyEnd];
+        }
+        $out = [];
+        for ($i = 0; $i + 1 < count($members); $i += 2) {
+            $out[] = [$members[$i], $members[$i + 1]];
+        }
+        return ['value' => $out, 'next' => $bodyEnd];
+    }
+
+    /** @param array<string,mixed> $t */
+    public static function encodeTypeFull(array $t): string
+    {
+        $out = chr($t['kind']) . str_repeat("\x00", 5);
+        $kind = $t['kind'];
+        if ($kind === Client::KIND_ENUM) {
+            $out .= self::appendEnumLabels($t['labels'] ?? []);
+        } elseif ($kind === Client::KIND_ARRAY) {
+            $out .= self::encodeTypeFull($t['elemType']);
+        } elseif ($kind === Client::KIND_MAP) {
+            $out .= self::encodeTypeFull($t['keyType']) . self::encodeTypeFull($t['elemType']);
+        } elseif ($kind === Client::KIND_STRUCT) {
+            $out .= self::u16le(count($t['fields']));
+            foreach ($t['fields'] as $f) {
+                $out .= self::u16str($f['name'], 255) . self::encodeTypeFull($f['type']);
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @return array{type: array<string,mixed>, payload: ?string}
+     */
+    public static function inferValue(mixed $v): array
+    {
+        if ($v === null) {
+            return ['type' => ['kind' => Client::KIND_STRING], 'payload' => null];
+        }
+        // ['kind' => 'struct', 'value' => [[name, val], ...]]
+        if (is_array($v) && ($v['kind'] ?? '') === 'struct') {
+            $fields = [];
+            $payloads = [];
+            foreach ($v['value'] as [$name, $fv]) {
+                $iv = self::inferValue($fv);
+                $fields[] = ['name' => (string) $name, 'type' => $iv['type']];
+                $payloads[] = $iv['payload'];
+            }
+            return ['type' => ['kind' => Client::KIND_STRUCT, 'fields' => $fields], 'payload' => self::collectionPayload($payloads)];
+        }
+        // ['kind' => 'map', 'value' => [[k, v], ...]]
+        if (is_array($v) && ($v['kind'] ?? '') === 'map') {
+            $types = [];
+            $payloads = [];
+            foreach ($v['value'] as [$k, $val]) {
+                $ik = self::inferValue($k);
+                $ivv = self::inferValue($val);
+                $types[] = $ik['type'];
+                $types[] = $ivv['type'];
+                $payloads[] = $ik['payload'];
+                $payloads[] = $ivv['payload'];
+            }
+            $keyType = ['kind' => Client::KIND_STRING];
+            $valType = ['kind' => Client::KIND_STRING];
+            for ($i = 0; $i < count($payloads); $i++) {
+                if ($payloads[$i] !== null) {
+                    if ($i % 2 === 0) { $keyType = $types[$i]; } else { $valType = $types[$i]; break; }
+                }
+            }
+            return ['type' => ['kind' => Client::KIND_MAP, 'keyType' => $keyType, 'elemType' => $valType], 'payload' => self::collectionPayload($payloads)];
+        }
+        // A plain list -> ARRAY.
+        if (is_array($v) && array_is_list($v)) {
+            $types = [];
+            $payloads = [];
+            foreach ($v as $x) {
+                $iv = self::inferValue($x);
+                $types[] = $iv['type'];
+                $payloads[] = $iv['payload'];
+            }
+            $elemType = ['kind' => Client::KIND_STRING];
+            foreach ($payloads as $i => $pl) {
+                if ($pl !== null) { $elemType = $types[$i]; break; }
+            }
+            return ['type' => ['kind' => Client::KIND_ARRAY, 'elemType' => $elemType], 'payload' => self::collectionPayload($payloads)];
+        }
+        $enc = self::encodeParam($v);
+        $kind = ord($enc[0]);
+        $hdr = 7;
+        if ($kind === Client::KIND_ENUM) {
+            $lc = self::u16($enc, 7);
+            $hdr = 9;
+            for ($i = 0; $i < $lc; $i++) {
+                $hdr += 2 + self::u16($enc, $hdr);
+            }
+        }
+        return ['type' => ['kind' => $kind], 'payload' => substr($enc, $hdr)];
+    }
+
+    /** @param array<int, ?string> $payloads */
+    public static function collectionPayload(array $payloads): string
+    {
+        $n = count($payloads);
+        $nb = intdiv($n + 7, 8);
+        $nulls = array_fill(0, max($nb, 0), 0);
+        $chunks = '';
+        foreach ($payloads as $i => $pl) {
+            if ($pl === null) {
+                $nulls[intdiv($i, 8)] |= 1 << ($i % 8);
+            } else {
+                $chunks .= $pl;
+            }
+        }
+        $nullBytes = '';
+        foreach ($nulls as $byte) {
+            $nullBytes .= chr($byte);
+        }
+        $body = self::u32le($n) . $nullBytes . $chunks;
+        return self::u32le(strlen($body)) . $body;
+    }
+
+    public static function encodeCollectionParam(mixed $v): string
+    {
+        $iv = self::inferValue($v);
+        $typeBody = substr(self::encodeTypeFull($iv['type']), 1);
+        return chr($iv['type']['kind']) . "\x00" . $typeBody . ($iv['payload'] ?? '');
+    }
+
+    // --- Spatial: EWKB decode (Spatial track, docs/design-spatial.md) ------
+
+    private const EWKB_SRID_FLAG = 0x20000000;
+    private const EWKB_TYPES = [
+        1 => 'Point', 2 => 'LineString', 3 => 'Polygon',
+        4 => 'MultiPoint', 5 => 'MultiLineString', 6 => 'MultiPolygon',
+        7 => 'GeometryCollection',
+    ];
+
+    /**
+     * @return array{value: array<string,mixed>, next: int}
+     */
+    public static function decodeEWKB(string $b, int $off, int $depth): array
+    {
+        if ($depth > 8) {
+            throw new Exception('protocol', 'geometry nesting too deep');
+        }
+        if ($off + 5 > strlen($b)) {
+            throw new Exception('protocol', 'truncated geometry');
+        }
+        if (ord($b[$off]) !== 1) {
+            throw new Exception('protocol', 'only little-endian EWKB is supported');
+        }
+        $tword = unpack('V', substr($b, $off + 1, 4))[1];
+        $gtype = $tword & ~self::EWKB_SRID_FLAG;
+        $p = $off + 5;
+        $srid = 0;
+        if ($tword & self::EWKB_SRID_FLAG) {
+            $srid = unpack('V', substr($b, $p, 4))[1];
+            $p += 4;
+        }
+        $name = self::EWKB_TYPES[$gtype] ?? null;
+        if ($name === null) {
+            throw new Exception('protocol', 'unknown geometry type');
+        }
+        $f64 = function () use ($b, &$p): float {
+            $v = unpack('e', substr($b, $p, 8))[1];
+            $p += 8;
+            return $v;
+        };
+        $u32 = function () use ($b, &$p): int {
+            $v = unpack('V', substr($b, $p, 4))[1];
+            $p += 4;
+            return $v;
+        };
+        $pts = function (int $n) use ($f64): array {
+            $out = [];
+            for ($i = 0; $i < $n; $i++) {
+                $out[] = [$f64(), $f64()];
+            }
+            return $out;
+        };
+        if ($gtype === 1) {
+            return ['value' => ['type' => $name, 'srid' => $srid, 'coordinates' => [$f64(), $f64()]], 'next' => $p];
+        }
+        if ($gtype === 2) {
+            return ['value' => ['type' => $name, 'srid' => $srid, 'coordinates' => $pts($u32())], 'next' => $p];
+        }
+        if ($gtype === 3) {
+            $nr = $u32();
+            $rings = [];
+            for ($r = 0; $r < $nr; $r++) {
+                $rings[] = $pts($u32());
+            }
+            return ['value' => ['type' => $name, 'srid' => $srid, 'coordinates' => $rings], 'next' => $p];
+        }
+        $np = $u32();
+        $parts = [];
+        for ($i = 0; $i < $np; $i++) {
+            $sub = self::decodeEWKB($b, $p, $depth + 1);
+            $p = $sub['next'];
+            $parts[] = $sub['value'];
+        }
+        $g = ['type' => $name, 'srid' => $srid];
+        if ($gtype === 7) {
+            $g['geometries'] = $parts;
+        } else {
+            $g['coordinates'] = array_map(static fn($x) => $x['coordinates'], $parts);
+        }
+        return ['value' => $g, 'next' => $p];
+    }
+
+    /** @param array<string,mixed> $g */
+    public static function geoToWKT(array $g): string
+    {
+        $pt = static fn(array $xy): string => "{$xy[0]} {$xy[1]}";
+        $ring = static fn(array $r): string => '(' . implode(', ', array_map($pt, $r)) . ')';
+        switch ($g['type']) {
+            case 'Point':
+                return 'POINT(' . $pt($g['coordinates']) . ')';
+            case 'LineString':
+                return 'LINESTRING(' . implode(', ', array_map($pt, $g['coordinates'])) . ')';
+            case 'Polygon':
+                return 'POLYGON(' . implode(', ', array_map($ring, $g['coordinates'])) . ')';
+            case 'MultiPoint':
+                return 'MULTIPOINT(' . implode(', ', array_map(static fn($c) => '(' . $pt($c) . ')', $g['coordinates'])) . ')';
+            case 'MultiLineString':
+                return 'MULTILINESTRING(' . implode(', ', array_map($ring, $g['coordinates'])) . ')';
+            case 'MultiPolygon':
+                return 'MULTIPOLYGON(' . implode(', ', array_map(
+                    static fn($poly) => '(' . implode(', ', array_map($ring, $poly)) . ')',
+                    $g['coordinates']
+                )) . ')';
+            case 'GeometryCollection':
+                return 'GEOMETRYCOLLECTION(' . implode(', ', array_map([self::class, 'geoToWKT'], $g['geometries'])) . ')';
+            default:
+                throw new Exception('invalid_argument', 'unsupported geometry type');
+        }
+    }
+
     /**
      * @param array{version:int,flags:int,secret:string,database:string,user:string,realm?:string} $h
      */
@@ -216,6 +587,24 @@ final class Protocol
         if (is_array($v)) {
             if (array_is_list($v) && $v !== [] && array_reduce($v, static fn($ok, $x) => $ok && is_numeric($x), true)) {
                 return self::encodeVector($v);
+            }
+            if (in_array($v['kind'] ?? '', ['struct', 'map'], true)) {
+                return self::encodeCollectionParam($v);
+            }
+            if (($v['kind'] ?? '') === 'array') {
+                return self::encodeCollectionParam($v['value']);
+            }
+            if (array_is_list($v)) {
+                // A non-numeric (or empty) list is an ARRAY collection param;
+                // the server re-coerces element types against the destination.
+                return self::encodeCollectionParam($v);
+            }
+            if (($v['kind'] ?? '') === 'geometry' || ($v['kind'] ?? '') === 'geography') {
+                $wkt = isset($v['wkt']) ? (string) $v['wkt'] : self::geoToWKT($v);
+                if (isset($v['srid']) && !str_starts_with(strtoupper($wkt), 'SRID=')) {
+                    $wkt = "SRID={$v['srid']};{$wkt}";
+                }
+                return chr(Client::KIND_STRING) . "\x00" . str_repeat("\x00", 5) . self::u32bytes($wkt, Client::MAX_PACKET);
             }
             if (isset($v['lon'], $v['lat'])) {
                 return chr(Client::KIND_POINT) . "\x00" . str_repeat("\x00", 5)
@@ -327,13 +716,21 @@ final class Protocol
         $flags = ord($b[$off + 1]);
         $off += 7;
         $enumLabels = null;
+        $collType = null;
         if ($kind === Client::KIND_ENUM) {
             $got = self::readEnumLabels($b, $off);
             $enumLabels = $got['value'];
             $off = $got['next'];
+        } elseif ($kind === Client::KIND_STRUCT || $kind === Client::KIND_ARRAY || $kind === Client::KIND_MAP) {
+            $collType = ['kind' => $kind];
+            $off = self::readNestedDescriptor($b, $off, $collType, 0);
         }
         if ($flags & Client::FLAG_NULL) {
             return ['value' => null, 'next' => $off, 'kind' => $kind, 'labels' => $enumLabels];
+        }
+        if ($kind === Client::KIND_STRUCT || $kind === Client::KIND_ARRAY || $kind === Client::KIND_MAP) {
+            $got = self::decodeCollectionPayload($b, $off, $collType);
+            return ['value' => $got['value'], 'next' => $got['next'], 'kind' => $kind];
         }
         switch ($kind) {
             case Client::KIND_UUID:
@@ -475,6 +872,11 @@ final class Protocol
                     $p += 8;
                 }
                 return ['value' => ['coords' => $coords], 'next' => $p, 'kind' => $kind];
+            case Client::KIND_GEOMETRY:
+            case Client::KIND_GEOGRAPHY:
+                $len = self::u32($b, $off);
+                $got = self::decodeEWKB($b, $off + 4, 0);
+                return ['value' => $got['value'], 'next' => $off + 4 + $len, 'kind' => $kind];
             case Client::KIND_POLYGON:
                 $nr = self::u16($b, $off);
                 $p = $off + 2;
@@ -513,6 +915,10 @@ final class Protocol
                 $got = self::readEnumLabels($b, $off);
                 $col['labels'] = $got['value'];
                 $off = $got['next'];
+            } elseif ($kind === Client::KIND_STRUCT || $kind === Client::KIND_ARRAY || $kind === Client::KIND_MAP) {
+                $ct = ['kind' => $kind];
+                $off = self::readNestedDescriptor($b, $off, $ct, 0);
+                $col['collType'] = $ct;
             }
             $cols[] = $col;
         }
