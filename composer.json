@@ -1,8 +1,20 @@
 {
-  "name": "nextsql/nextsql",
-  "description": "Official NextSQL PHP driver. Keys never go in URLs.",
+  "name": "bzync/nextsql",
+  "description": "Official NextSQL PHP driver. Speaks the native NSQL v1 protocol. Keys never go in URLs.",
   "type": "library",
-  "license": "proprietary",
+  "license": "MIT",
+  "keywords": ["nextsql", "database", "sql", "driver", "client", "encryption", "vector", "full-text-search"],
+  "homepage": "https://nextsql.bzync.com/docs/drivers",
+  "support": {
+    "issues": "https://github.com/bzync/nextsql/issues",
+    "source": "https://github.com/bzync/nextsql/tree/master/drivers/php"
+  },
+  "authors": [
+    {
+      "name": "Rayan Reynaldo",
+      "homepage": "https://www.bzync.com"
+    }
+  ],
   "require": {
     "php": ">=8.1",
     "ext-openssl": "*"
