@@ -102,6 +102,15 @@ $goCiphertext = 'NSCE1.AQECdjEDAAAAAABEeyxf_quGP5And9z0FmNijEp3uSiDspby_y1zIxe9L
 if (FieldEncryption::decrypt(new MemoryFieldKeyring($v1), 'app', 'accounts', 'secret', FieldType::text(), $goCiphertext) !== 'portable') {
     fail('Go ciphertext portability');
 }
+$deterministicCiphertext = FieldEncryption::encryptDeterministic(new MemoryFieldKeyring($v1), 'app', 'accounts', 'secret', FieldType::text(), 'portable');
+$goDeterministicCiphertext = 'NSCE2.AgICdjEDAAAAAADlFfKNZjDtO9v-sO8n1efAOo2JQ72kt938TLBP';
+if ($deterministicCiphertext !== $goDeterministicCiphertext ||
+    FieldEncryption::decryptDeterministic(new MemoryFieldKeyring($v1), 'app', 'accounts', 'secret', FieldType::text(), $deterministicCiphertext) !== 'portable') {
+    fail('NSCE2 cross-driver portability');
+}
+expectException(static function () use ($v1, $deterministicCiphertext): void {
+    FieldEncryption::decryptDeterministic(new MemoryFieldKeyring($v1), 'app', 'accounts', 'other', FieldType::text(), $deterministicCiphertext);
+}, 'crypto');
 
 $fkDir = sys_get_temp_dir() . '/nextsql-fk-' . bin2hex(random_bytes(8));
 mkdir($fkDir);
@@ -522,5 +531,35 @@ $geoEnc = Protocol::encodeParam(["kind" => "geometry", "wkt" => "POINT(1 2)", "s
 if (Protocol::decodeValue($geoEnc, 0)["value"] !== "SRID=4326;POINT(1 2)") {
     fail("spatial geometry param encode");
 }
+
+// Public error taxonomy (docs/error-codes.md): the negotiated shape carries the
+// stable ERR_* name without disturbing the legacy class, and the v1 shape a
+// server that ignores the request bit sends must still decode.
+$negotiated = Protocol::u16str("serialization") . Protocol::u16str("retry me") . Protocol::u16str("ERR_SERIALIZATION");
+$err = Protocol::decodeError($negotiated);
+if ($err->errorCode !== "serialization" || $err->publicCode !== "ERR_SERIALIZATION") {
+    fail("negotiated error decode -> " . $err->errorCode . " / " . $err->publicCode);
+}
+$legacy = Protocol::decodeError(Protocol::u16str("conflict") . Protocol::u16str("nope"));
+if ($legacy->errorCode !== "conflict" || $legacy->publicCode !== "") {
+    fail("legacy error decode -> " . $legacy->errorCode . " / " . $legacy->publicCode);
+}
+// A present-but-empty public code is a second encoding of the v1 shape.
+expectException(
+    static fn () => Protocol::decodeError(Protocol::u16str("conflict") . Protocol::u16str("nope") . Protocol::u16str("")),
+    "protocol",
+);
+
+$helloOK = Protocol::u16le(1) . chr(Client::AUTH_PASSWORD) . str_repeat("S", 8);
+$v1Hello = Protocol::decodeHelloOK($helloOK);
+if ($v1Hello["flags"] !== 0) {
+    fail("v1 hello-ok claimed flags " . $v1Hello["flags"]);
+}
+$capHello = Protocol::decodeHelloOK($helloOK . Protocol::u16le(Client::FLAG_PUBLIC_ERROR_CODES));
+if ($capHello["flags"] !== Client::FLAG_PUBLIC_ERROR_CODES) {
+    fail("negotiated hello-ok flags " . $capHello["flags"]);
+}
+expectException(static fn () => Protocol::decodeHelloOK($helloOK . Protocol::u16le(0)), "protocol");
+expectException(static fn () => Protocol::decodeHelloOK("short"), "protocol");
 
 fwrite(STDOUT, "ok\n");

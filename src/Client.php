@@ -51,6 +51,14 @@ final class Client
     public const AUTH_PASSWORD = 1;
     public const AUTH_PASSWORD_KEY = 2;
     public const FLAG_CANCEL = 1;
+    /**
+     * Asks the server for the stable ERR_* error taxonomy
+     * (docs/error-codes.md). A server that does not implement it ignores the
+     * bit and keeps the NSQL v1 error shape, which Protocol::decodeError still
+     * reads, so setting it is safe against any server version. The server
+     * echoes it in the hello-ok flags when it was accepted.
+     */
+    public const FLAG_PUBLIC_ERROR_CODES = 2;
     public const FLAG_NULL = 0x01;
 
     public const KIND_UUID = 1;
@@ -98,6 +106,8 @@ final class Client
     /** @var array<string, mixed> */
     private array $cfg;
     private string $secret = '';
+    /** Whether the server echoed FLAG_PUBLIC_ERROR_CODES; diagnostic only. */
+    private bool $publicErrorCodes = false;
     private bool $busy = false;
 
     /**
@@ -340,7 +350,7 @@ final class Client
     {
         $this->writeFrame(self::TYPE_HELLO, Protocol::encodeHello([
             'version' => self::VERSION,
-            'flags' => 0,
+            'flags' => self::FLAG_PUBLIC_ERROR_CODES,
             'secret' => "\x00\x00\x00\x00\x00\x00\x00\x00",
             'database' => (string) ($this->cfg['database'] ?? ''),
             'user' => (string) $this->cfg['user'],
@@ -352,6 +362,9 @@ final class Client
         }
         $ok = Protocol::decodeHelloOK($msg['payload']);
         $this->secret = $ok['secret'];
+        // Diagnostic only: Protocol::decodeError reads the field whenever it is
+        // present, so nothing depends on this having been echoed.
+        $this->publicErrorCodes = ($ok['flags'] & self::FLAG_PUBLIC_ERROR_CODES) !== 0;
         $this->writeFrame(self::TYPE_AUTH, Protocol::u16str((string) ($this->cfg['password'] ?? '')));
         $msg = $this->readFrame();
         if ($msg['type'] !== self::TYPE_AUTH_OK) {
@@ -405,6 +418,20 @@ final class Client
         }
         return FieldEncryption::decrypt($provider, (string) ($this->cfg['database'] ?? ''), $table, $column, $type, $ciphertext);
     }
+
+	public function encryptFieldDeterministic(string $table, string $column, array $type, mixed $value): ?string
+	{
+		$provider = $this->cfg['fieldKeys'] ?? null;
+		if (!$provider instanceof FieldKeyProvider) throw new Exception('invalid_argument', 'field key provider is required');
+		return FieldEncryption::encryptDeterministic($provider, (string) ($this->cfg['database'] ?? ''), $table, $column, $type, $value);
+	}
+
+	public function decryptFieldDeterministic(string $table, string $column, array $type, ?string $ciphertext): mixed
+	{
+		$provider = $this->cfg['fieldKeys'] ?? null;
+		if (!$provider instanceof FieldKeyProvider) throw new Exception('invalid_argument', 'field key provider is required');
+		return FieldEncryption::decryptDeterministic($provider, (string) ($this->cfg['database'] ?? ''), $table, $column, $type, $ciphertext);
+	}
 
     /**
      * @param list<mixed> $params

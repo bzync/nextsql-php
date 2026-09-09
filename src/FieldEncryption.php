@@ -4,10 +4,11 @@ declare(strict_types=1);
 
 namespace NextSQL;
 
-/** Portable randomized NSCE1 AES-256-GCM field encryption. */
+/** Portable randomized NSCE1 and deterministic NSCE2 field encryption. */
 final class FieldEncryption
 {
     public const PREFIX = 'NSCE1.';
+    public const DETERMINISTIC_PREFIX = 'NSCE2.';
     public const MAX_PLAINTEXT = 1 << 20;
     private const MAX_KEY_ID = 64;
     private const NONCE_SIZE = 12;
@@ -98,6 +99,9 @@ final class FieldEncryption
             return null;
         }
         $parsed = self::inspect($ciphertext);
+		if ($parsed['mode'] !== 'randomized') {
+			throw new Exception('invalid_format', 'deterministic ciphertext requires decryptDeterministic');
+		}
         if ($parsed['type'] !== $expected) {
             throw new Exception('invalid_format', 'encrypted logical type mismatch');
         }
@@ -134,13 +138,55 @@ final class FieldEncryption
         return self::decodeScalar($expected, $plain);
     }
 
-    /** @return array{keyID:string,type:array{kind:int,precision:int,scale:int,vecElem:int},body:string,headerLength:int} */
+	/** @param array{kind:int,precision:int,scale:int,vecElem:int} $type */
+	public static function encryptDeterministic(
+		FieldKeyProvider $provider, string $database, string $table, string $column,
+		array $type, mixed $value
+	): ?string {
+		$type = self::normalizeType($type);
+		if ($value === null) return null;
+		$plain = self::encodeScalar($type, $value);
+		if (strlen($plain) > self::MAX_PLAINTEXT) throw new Exception('exhausted', 'plaintext exceeds field limit');
+		try { $key = $provider->currentFieldKey($database, $table, $column); self::validateKey($key); }
+		catch (\Throwable) { throw new Exception('crypto', 'field key unavailable'); }
+		$material = self::deterministicKey($key['material']);
+		$header = self::header($key['id'], $type, null);
+		$associated = self::aad($database, $table, $column, $header, self::DETERMINISTIC_PREFIX);
+		$tag = self::s2v(substr($material, 0, 16), $associated, $plain);
+		$sealed = self::ctr(substr($material, 16), $tag, $plain);
+		return self::DETERMINISTIC_PREFIX . rtrim(strtr(base64_encode($header . $tag . $sealed), '+/', '-_'), '=');
+	}
+
+	/** @param array{kind:int,precision:int,scale:int,vecElem:int} $expected */
+	public static function decryptDeterministic(
+		FieldKeyProvider $provider, string $database, string $table, string $column,
+		array $expected, ?string $ciphertext
+	): mixed {
+		$expected = self::normalizeType($expected);
+		if ($ciphertext === null) return null;
+		$parsed = self::inspect($ciphertext);
+		if ($parsed['mode'] !== 'deterministic' || $parsed['type'] !== $expected) throw new Exception('invalid_format', 'encrypted mode or logical type mismatch');
+		try { $key = $provider->fieldKey($database, $table, $column, $parsed['keyID']); self::validateKey($key); if ($key['id'] !== $parsed['keyID']) throw new \RuntimeException(); }
+		catch (\Throwable) { throw new Exception('crypto', 'field key unavailable or revoked'); }
+		$material = self::deterministicKey($key['material']);
+		$tag = substr($parsed['body'], $parsed['headerLength'], 16);
+		$plain = self::ctr(substr($material, 16), $tag, substr($parsed['body'], $parsed['headerLength'] + 16));
+		$expectedTag = self::s2v(substr($material, 0, 16), self::aad($database, $table, $column, substr($parsed['body'], 0, $parsed['headerLength']), self::DETERMINISTIC_PREFIX), $plain);
+		if (!hash_equals($tag, $expectedTag)) throw new Exception('crypto', 'ciphertext authentication failed');
+		return self::decodeScalar($expected, $plain);
+	}
+
+	/** @return array{keyID:string,type:array{kind:int,precision:int,scale:int,vecElem:int},body:string,headerLength:int,mode:string} */
     public static function inspect(string $ciphertext): array
     {
-        if (!str_starts_with($ciphertext, self::PREFIX)) {
+		if (str_starts_with($ciphertext, self::PREFIX)) {
+			$prefix = self::PREFIX; $version = 1; $suite = 1; $nonceSize = self::NONCE_SIZE; $mode = 'randomized';
+		} elseif (str_starts_with($ciphertext, self::DETERMINISTIC_PREFIX)) {
+			$prefix = self::DETERMINISTIC_PREFIX; $version = 2; $suite = 2; $nonceSize = 0; $mode = 'deterministic';
+		} else {
             throw new Exception('invalid_format', 'invalid client ciphertext prefix');
         }
-        $encoded = substr($ciphertext, strlen(self::PREFIX));
+		$encoded = substr($ciphertext, strlen($prefix));
         $maxEncoded = (int) ceil((self::MAX_PLAINTEXT + 101) * 4 / 3);
         if ($encoded === '' || strlen($encoded) > $maxEncoded || strlen($encoded) % 4 === 1 ||
             !preg_match('/^[A-Za-z0-9_-]+$/D', $encoded)) {
@@ -149,11 +195,11 @@ final class FieldEncryption
         $padded = strtr($encoded, '-_', '+/') . str_repeat('=', (4 - strlen($encoded) % 4) % 4);
         $body = base64_decode($padded, true);
         if ($body === false || rtrim(strtr(base64_encode($body), '+/', '-_'), '=') !== $encoded ||
-            strlen($body) < 38 || ord($body[0]) !== 1 || ord($body[1]) !== 1) {
+			strlen($body) < 3 + 1 + 6 + $nonceSize + self::TAG_SIZE || ord($body[0]) !== $version || ord($body[1]) !== $suite) {
             throw new Exception('invalid_format', 'unsupported or truncated client ciphertext');
         }
         $n = ord($body[2]);
-        if ($n < 1 || $n > self::MAX_KEY_ID || strlen($body) < 3 + $n + 6 + self::NONCE_SIZE + self::TAG_SIZE) {
+		if ($n < 1 || $n > self::MAX_KEY_ID || strlen($body) < 3 + $n + 6 + $nonceSize + self::TAG_SIZE) {
             throw new Exception('invalid_format', 'invalid field key id length');
         }
         $keyID = substr($body, 3, $n);
@@ -167,7 +213,7 @@ final class FieldEncryption
             'scale' => Protocol::u16($body, $off + 3),
             'vecElem' => ord($body[$off + 5]),
         ], 'invalid_format');
-        return ['keyID' => $keyID, 'type' => $type, 'body' => $body, 'headerLength' => $off + 6 + self::NONCE_SIZE];
+		return ['keyID' => $keyID, 'type' => $type, 'body' => $body, 'headerLength' => $off + 6 + $nonceSize, 'mode' => $mode];
     }
 
     /** @param array{kind:int,precision:int,scale:int,vecElem:int} $type */
@@ -477,16 +523,16 @@ final class FieldEncryption
     }
 
     /** @param array{kind:int,precision:int,scale:int,vecElem:int} $type */
-    private static function header(string $keyID, array $type, string $nonce): string
+	private static function header(string $keyID, array $type, ?string $nonce): string
     {
-        return "\x01\x01" . chr(strlen($keyID)) . $keyID . chr($type['kind'])
+		return ($nonce === null ? "\x02\x02" : "\x01\x01") . chr(strlen($keyID)) . $keyID . chr($type['kind'])
             . Protocol::u16le($type['precision']) . Protocol::u16le($type['scale'])
             . chr($type['vecElem']) . $nonce;
     }
 
-    private static function aad(string $database, string $table, string $column, string $publicHeader): string
+	private static function aad(string $database, string $table, string $column, string $publicHeader, string $prefix = self::PREFIX): string
     {
-        $out = self::PREFIX;
+		$out = $prefix;
         foreach ([$database, $table, $column] as $name) {
             if ($name === '' || strlen($name) > 0xFFFF) {
                 throw new Exception('invalid_argument', 'database, table, and column are required and bounded');
@@ -495,6 +541,55 @@ final class FieldEncryption
         }
         return $out . $publicHeader;
     }
+
+	private static function aesBlock(string $key, string $block): string
+	{
+		$out = openssl_encrypt($block, 'aes-128-ecb', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING);
+		if ($out === false || strlen($out) !== 16) throw new Exception('crypto', 'AES-SIV block encryption failed');
+		return $out;
+	}
+
+	private static function dbl(string $block): string
+	{
+		$out = str_repeat("\0", 16); $carry = 0;
+		for ($i = 15; $i >= 0; $i--) { $b = ord($block[$i]); $out[$i] = chr((($b << 1) & 0xff) | $carry); $carry = ($b >> 7) & 1; }
+		if ($carry !== 0) $out[15] = chr(ord($out[15]) ^ 0x87);
+		return $out;
+	}
+
+	private static function cmac(string $key, string $message): string
+	{
+		$k1 = self::dbl(self::aesBlock($key, str_repeat("\0", 16))); $k2 = self::dbl($k1);
+		$n = strlen($message); $blocks = max(1, (int) ceil($n / 16));
+		if ($n > 0 && $n % 16 === 0) $last = substr($message, $n - 16) ^ $k1;
+		else { $rem = $n % 16; $last = substr($message, $n - $rem) . "\x80" . str_repeat("\0", 15 - $rem); $last ^= $k2; }
+		$y = str_repeat("\0", 16);
+		for ($i = 0; $i < $blocks - 1; $i++) $y = self::aesBlock($key, $y ^ substr($message, $i * 16, 16));
+		return self::aesBlock($key, $y ^ $last);
+	}
+
+	private static function s2v(string $key, string $associated, string $plain): string
+	{
+		$d = self::dbl(self::cmac($key, str_repeat("\0", 16))) ^ self::cmac($key, $associated);
+		if (strlen($plain) >= 16) { $off = strlen($plain) - 16; $t = substr($plain, 0, $off) . (substr($plain, $off) ^ $d); }
+		else { $t = self::dbl($d) ^ ($plain . "\x80" . str_repeat("\0", 15 - strlen($plain))); }
+		return self::cmac($key, $t);
+	}
+
+	private static function ctr(string $key, string $tag, string $input): string
+	{
+		$counter = $tag; $counter[8] = chr(ord($counter[8]) & 0x7f); $counter[12] = chr(ord($counter[12]) & 0x7f);
+		$out = openssl_encrypt($input, 'aes-128-ctr', $key, OPENSSL_RAW_DATA, $counter);
+		if ($out === false) throw new Exception('crypto', 'AES-SIV counter encryption failed');
+		return $out;
+	}
+
+	private static function deterministicKey(string $material): string
+	{
+		$out = hash_hkdf('sha256', $material, 32, 'NextSQL NSCE2 AES-SIV v2', '');
+		if (strlen($out) !== 32) throw new Exception('crypto', 'deterministic key derivation failed');
+		return $out;
+	}
 
     /** @param array<string,mixed> $type @return array{kind:int,precision:int,scale:int,vecElem:int} */
     private static function normalizeType(array $type, string $code = 'invalid_argument'): array

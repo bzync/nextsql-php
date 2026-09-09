@@ -65,6 +65,24 @@ try {
         throw new RuntimeException('bounded read mismatch');
     }
     $conn->setReadConsistency(Client::READ_STRONG);
+
+    // Public error taxonomy (docs/error-codes.md): a real server error carries
+    // the stable ERR_* name alongside the unchanged legacy class.
+    $caught = null;
+    try {
+        $conn->exec('SELECT * FROM no_such_table');
+    } catch (NextSQL\Exception $e) {
+        $caught = $e;
+    }
+    if ($caught === null) {
+        throw new RuntimeException('expected an error from an unknown table');
+    }
+    if ($caught->errorCode === '') {
+        throw new RuntimeException('legacy error class missing');
+    }
+    if ($caught->publicCode !== 'ERR_' . strtoupper($caught->errorCode)) {
+        throw new RuntimeException('public code ' . $caught->publicCode . ' for class ' . $caught->errorCode);
+    }
 } finally {
     $conn->close();
 }

@@ -518,17 +518,28 @@ final class Protocol
     }
 
     /**
-     * @return array{version:int,authMethod:int,secret:string}
+     * @return array{version:int,authMethod:int,secret:string,flags:int}
      */
     public static function decodeHelloOK(string $b): array
     {
-        if (strlen($b) !== 11) {
+        $n = strlen($b);
+        if ($n !== 11 && $n !== 13) {
             throw new Exception('protocol', 'bad hello-ok length');
+        }
+        $flags = 0;
+        if ($n === 13) {
+            $flags = self::u16($b, 11);
+            // The server omits the field when it accepted no capability, so a
+            // present-but-zero field is a second encoding of the v1 hello-ok.
+            if ($flags === 0) {
+                throw new Exception('protocol', 'empty hello-ok flags');
+            }
         }
         return [
             'version' => self::u16($b, 0),
             'authMethod' => ord($b[2]),
             'secret' => substr($b, 3, 8),
+            'flags' => $flags,
         ];
     }
 
@@ -961,7 +972,18 @@ final class Protocol
     {
         $code = self::readU16String($b, 0, Client::MAX_NAME);
         $msg = self::readU16String($b, $code['next'], Client::MAX_NAME);
-        return new Exception($code['value'], $msg['value']);
+        // Optional trailing field, present only from a server that accepted
+        // FLAG_PUBLIC_ERROR_CODES. Its absence is normal -- an older server
+        // ignores the request bit -- so this must never be required.
+        $public = '';
+        if ($msg['next'] < strlen($b)) {
+            $p = self::readU16String($b, $msg['next'], Client::MAX_NAME);
+            if ($p['value'] === '') {
+                throw new Exception('protocol', 'empty public error code');
+            }
+            $public = $p['value'];
+        }
+        return new Exception($code['value'], $msg['value'], 0, null, $public);
     }
 
     private static function packU64le(int $n): string
